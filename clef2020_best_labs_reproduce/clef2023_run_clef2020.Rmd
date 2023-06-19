@@ -1,0 +1,1140 @@
+---
+title: "clef2023_reproducibility"
+output: html_document
+date: "2023-05-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+# set seed for a replication random sampling 
+set.seed(123)
+
+library(Matrix)
+library(tibble)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(dplyr)
+library(gridExtra)
+
+source("../official/load_data.R")
+source("../official/stem_query.R")
+source("../official/find_features_stem.R")
+source("../official/rank_documents_stem.R")
+source("../official/get_next_k_docs.R")
+
+```
+
+## R Markdown
+
+Set parameters
+
+```{r parameters}
+# set hyper-parameters
+# m1: angular coefficient during ranking
+m1 <- 1.0
+# p: percent of documents to read from the pool
+p <- 100
+# f: number of features to add each round
+f  <- 200
+# m2 angular coefficient after top k documents
+m2 <- 1.0
+# thresh: number of documents that a physician is willing to read
+thresh <- 600
+# prec: minimum level of precision during classification phase
+prec <- 0.1
+
+# create run identifier
+run_id <- paste0("m", m1 * 10, "p", p, "f", f, "t", thresh, "p", prec * 10, "m", m2 * 10)
+
+# give run name
+run_name <- paste0("2019_official_", run_id)
+
+# stop if you already have this run
+if(file.exists(paste0("./runs/local/", run_name))) {
+  stop(paste0("run ", run_name, " already exists"))
+}
+
+```
+
+## Set hyperparameters
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+# define BM25 smoothing (hyper-)parameters (rel: relevant, nonrel: non relevant)
+alpha_rel <- 0.1
+beta_rel  <- 0.01
+alpha_nonrel <- 1.0
+beta_nonrel  <- 1.0
+
+# build trec-like run dataframe
+run <- tibble(topic_id = character(),
+                  #interaction = character(),
+                  threshold = numeric(),
+                  pid = character(),
+                  rank = numeric(),
+                  score = numeric(), #invert scores for treceval
+                  run_id = character(),
+                  relevance = numeric())
+
+# get topics
+
+path <- "/Users/gmdn/Library/CloudStorage/GoogleDrive-giorgiomaria.dinunzio@unipd.it/My Drive/MEGA/Programming/R/CLEF/2019/Labs/eHealth/Task2/indexing/read_pubmed/pubmed_data/test/"
+path2 <- "/Users/gmdn/Library/CloudStorage/GoogleDrive-giorgiomaria.dinunzio@unipd.it/My Drive/MEGA/Programming/R/CLEF/2019/Labs/eHealth/Task2/indexing/index_collection/indexes/test/"
+
+topics <- list.files(path)
+
+```
+
+run code
+
+```{r run_code}
+
+#topic <- topics[1] 
+#{
+for(topic in topics) {
+  # display topic
+  print(paste0("[", which(topics == topic), "] ranking pids for topic ", topic))
+  
+  # load index for topic
+  load(paste0(path2, topic, "_index.RData"))
+  
+  # generate sparse binary
+  sparse_binary <- sparse_tf
+  sparse_binary@x <- rep(1, length(sparse_binary@x))
+  
+  documents <- sparse_tf@Dimnames[[1]]
+  terms <- sparse_tf@Dimnames[[2]]
+  #print(num_of_documents)
+  
+  # subset qrels 
+  qrels <- qrels_abs_test %>%
+    filter(topic == !!topic) %>%
+    select(pid, relevant)
+  
+  # subset qrels with pids only
+  qrels <- qrels %>%
+    filter(pid %in% documents)
+  
+  # find pids that are not in qrels
+  pids_not_in_qrels <- setdiff(documents, qrels$pid)
+  
+  # for those pids, set relevance to zero
+  if(length(pids_not_in_qrels) > 0) {
+    qrels <- qrels %>%
+      bind_rows(tibble(pid = pids_not_in_qrels,
+                       relevant = 0))
+  }
+  
+  # sort qrels in the same way dtm pids are sorted
+  qrels <- qrels[order(qrels$pid), ]
+  
+  # initialize relevance feedback vector
+  # -1 : not judged 
+  #  0 : not relevant
+  #  1 : relevant
+  relevance_feedback <- rep.int(-1, times = num_of_documents)
+  
+  # initialize selection strategy dataframe
+  strategy <- factor(levels = c("ranked", "sampled"))
+  selection_strategy <- tibble(round = integer(),
+                               id = integer(), 
+                               relevance = integer(), 
+                               strategy = strategy)
+  
+  
+  # In the first pass, we estimate the parameters of the non-relevant documents 
+  # using the whole collection.
+  # (WE SHOULD ADD NUMBER OF FEATURES IN THE RDATA file, future work)
+  theta_rel <- rep(alpha_rel / (alpha_rel + beta_rel), times = dim(sparse_binary)[2])
+  theta_nonrel <- (colSums(sparse_binary) + alpha_nonrel) / (num_of_documents + alpha_nonrel + beta_nonrel)
+  
+  # BIM weight for relevant and non relevant set (log(theta / (1 - theta)))
+  bim_rel <- log(theta_rel) - log(1 - theta_rel)
+  bim_nonrel <- log(theta_nonrel) - log(1 - theta_nonrel)
+  
+  # read original query
+  query_original <- readLines(paste0(path, 
+                                     topic, 
+                                     "/topic_title.txt"))
+  # get features
+  features <- find_features_stem(query_original)
+  #features_variant_keyword <- c() ## find_features(query_variant_keywords)
+  #features_variant_readable <- c() ## find_features(query_variant_readable)
+  
+  # find number of documents to assess
+  k <- ceiling(num_of_documents * p / 100)
+  
+  # adjust if necessary
+  if (k > thresh/2 & thresh > 0) { # if k is greater than threshold
+    k <- thresh/2
+  }
+  if (k > num_of_documents) { # if k is greater than number of available documents (legacy code?)
+    k <- num_of_documents
+  }
+  print(paste0("number of docs to judge: ", k))
+  
+  # prepare samples
+  samples_not_ranked <- sample(1:num_of_documents, replace = FALSE)
+  next_sample_to_read <- 1
+  
+  # set number of relevant documents
+  num_of_rel_documents <- 0
+  
+  #####################################################################
+  ##### START FEEDBACK
+  #####################################################################
+  # i <- 1
+  for(i in 1:k) {
+    
+    # alternate between ranking and sampling of the next document to judge
+    #if (i %% 10 > 0) { # rank documents and select first doc
+      
+      # rank documents with original query
+      ranking <- rank_documents_stem(features, m = m1)
+      #ranking_variant1 <- rank_documents(features_variant1, m = m1)
+      
+      # set the number of top k documents to assess (k = 1)
+      pids_feedback <- get_next_k_docs(ranking, qrels, relevance_feedback, k = 1)
+      
+      # get scores of top k
+      scores <- ranking$scores[which(ranking$pids %in% pids_feedback)]
+      
+      # get indexes of documents to get relevance scores
+      idx_pids_feedback <- which(qrels$pid %in% pids_feedback)
+      
+      # update relevance feedback vector
+      relevance_feedback[idx_pids_feedback] <- qrels$relevant[idx_pids_feedback]
+      
+      # update selection strategy vector
+      selection_strategy <- selection_strategy %>%
+        bind_rows(data.frame(round = i,
+                             id = idx_pids_feedback, 
+                             relevance = relevance_feedback[idx_pids_feedback],
+                             strategy = "ranked"))
+      
+    # } else {
+    #   
+    #   idx_pids_feedback <- samples_not_ranked[next_sample_to_read]
+    #   next_sample_to_read <- next_sample_to_read + 1
+    #   
+    #   # check whether this doc has already been judged
+    #   if (relevance_feedback[idx_pids_feedback] == -1) {
+    #     
+    #     # get pids
+    #     pids_feedback <- qrels$pid[idx_pids_feedback]
+    #     
+    #     # set score (zero, since it has not been ranked)
+    #     scores <- 0
+    #     
+    #     # update relevance feedback vector
+    #     relevance_feedback[idx_pids_feedback] <- qrels$relevant[idx_pids_feedback]
+    #     
+    #     # update selection strategy vector
+    #     selection_strategy[i, ] <- data.frame(idx_pids_feedback, 
+    #                                           relevance_feedback[idx_pids_feedback],
+    #                                           "sampled")
+    #     
+    #   } else {
+    #     
+    #     # update selection strategy vector
+    #     selection_strategy[i, ] <- data.frame(idx_pids_feedback, 
+    #                                           relevance_feedback[idx_pids_feedback],
+    #                                           "sampled")
+    #     
+    #     # continue for loop (skip following code)
+    #     next
+    #     
+    #   }
+      
+    #}
+    
+    # update run item
+    run_update <- data.frame(topic_id = topic,
+                             interaction = 0,
+                             pid = pids_feedback,
+                             rank = sum(relevance_feedback != -1), # (sum(relevance_feedback != -1) + 1):(sum(relevance_feedback != -1) + 1),
+                             score = -scores, #invert scores for treceval
+                             run_id = run_name,
+                             relevance = relevance_feedback[idx_pids_feedback])
+    
+    # write run on file
+    write.table(run_update, file = paste0("./runs/local/", run_name),
+                row.names = FALSE,
+                col.names = FALSE,
+                quote = FALSE,
+                append = T)
+    
+    # update if necessary
+    if (num_of_rel_documents < sum(relevance_feedback == 1)) {
+      
+      # compute number of relevant documents
+      num_of_rel_documents <- sum(relevance_feedback == 1)
+      
+      # estimate the parameters for the relevant set and the relevant features
+      if(num_of_rel_documents > 1) {
+        # document frequency
+        doc_freq <- colSums(sparse_binary[relevance_feedback == 1, ])
+        # compute relevant parameters
+        theta_rel <- (doc_freq + alpha_rel) / (num_of_rel_documents + alpha_rel + beta_rel)
+      } else if (num_of_rel_documents == 1) {
+        doc_freq <- sparse_binary[relevance_feedback == 1, ]
+        theta_rel <- (doc_freq + alpha_rel) / (num_of_rel_documents + alpha_rel + beta_rel)
+      }
+      # re-estimate the parameters for the non-relevant set (including unjudged)
+      theta_nonrel <- (colSums(sparse_binary[relevance_feedback < 1, ]) + alpha_nonrel) / (num_of_documents - num_of_rel_documents + alpha_nonrel + beta_nonrel)
+      
+      # BIM weight for relevant and non relevant set (log(theta / (1 - theta)))
+      bim_rel <- log(theta_rel) - log(1 - theta_rel)
+      bim_nonrel <- log(theta_nonrel) - log(1 - theta_nonrel)
+      
+    }
+    
+    # select most relevant features (include query terms)
+    if(num_of_rel_documents > 0) {
+      # select features with the higest difference between probabilities (of rel and nonrel)
+      p_q <- theta_rel - theta_nonrel
+      # if number of features (parameter) is greater than 0
+      if (f > 0) {
+        features <- union(features, 
+                          head(order(p_q, decreasing = TRUE), f))
+      } else { # increment f at each round
+        features <- union(features,
+                          head(order(p_q, decreasing = TRUE), i))
+      }
+    }
+  }
+  #####################################################################
+  ##### END FEEDBACK
+  #####################################################################
+  
+  
+  ##################################################################
+  ##### START CLASSIFICATION
+  ##################################################################
+  
+  # recompute number of rel and non-rel documents
+  num_of_rel_documents <- sum(relevance_feedback == 1)
+  num_of_nonrel_documents <- sum(relevance_feedback == 0)
+  
+  # estimate the parameters for the relevant set and the relevant features
+  if(num_of_rel_documents > 1) {
+    # document frequency
+    doc_freq <- colSums(sparse_binary[relevance_feedback == 1, ])
+    # compute relevant parameters
+    theta_rel <- (doc_freq + alpha_rel) / (num_of_rel_documents + alpha_rel + beta_rel)
+    # find non-zero features (legacy)
+    #rel_features <- which(doc_freq > 0)
+    features_nonzero <- which(colSums(sparse_binary[relevance_feedback == 1, ]) > 0)
+    
+  } else if (num_of_rel_documents == 1) {
+    doc_freq <- sparse_binary[relevance_feedback == 1, ]
+    theta_rel <- (doc_freq + alpha_rel) / (num_of_rel_documents + alpha_rel + beta_rel)
+    # (legacy)
+    #rel_features <- which(doc_freq > 0)
+    features_nonzero <- which(sparse_binary[relevance_feedback == 1, ] > 0)
+    
+  } else { # use non-relevant information
+    # doc_freq <- colSums(sparse_binary[relevance_feedback == 0, ])
+    #  (legacy)
+    #rel_features <- which(doc_freq > 0)
+    print("found no relevant docs")
+    features_nonzero <- which(colSums(sparse_binary[relevance_feedback == 0, ]) > 0)
+  }
+  
+  # re-estimate the parameters for the non-relevant set
+  if(num_of_nonrel_documents > 1) {
+    theta_nonrel <- (colSums(sparse_binary[relevance_feedback == 0, ]) + alpha_nonrel) / (num_of_nonrel_documents + alpha_nonrel + beta_nonrel)  
+  } else if(num_of_nonrel_documents == 1) {
+    theta_nonrel <- (sparse_binary[relevance_feedback == 0, ] + alpha_nonrel) / (num_of_nonrel_documents + alpha_nonrel + beta_nonrel)  
+  } else {
+    theta_nonrel <- (alpha_nonrel) / (alpha_nonrel + beta_nonrel)
+  }
+  
+  # BIM weight for relevant and non relevant set (log(theta / (1 - theta)))
+  bim_rel <- log(theta_rel) - log(1 - theta_rel)
+  bim_nonrel <- log(theta_nonrel) - log(1 - theta_nonrel)
+  
+  # compute coordinates only on relevant features
+  x <- sparse_bm25[, features_nonzero] %*% bim_rel[features_nonzero]
+  y <- sparse_bm25[, features_nonzero] %*% bim_nonrel[features_nonzero]
+  plot(x, y, col = relevance_feedback + 2, cex = 0.5)
+  
+  # get indexes of relevant and non-relevant documents
+  idx_doc_rel <- which(relevance_feedback == 1)
+  idx_doc_nonrel <- which(relevance_feedback == 0)
+  
+  # indexes of judged documents
+  idx_doc_judged <- which(relevance_feedback > -1)
+  
+  # indexes of to be judged documents
+  idx_doc_to_judge <- which(relevance_feedback < 0)
+  
+  # if there is a sufficient number of relevant documents
+  if(length(idx_doc_rel) >= 3) {
+    # chech the rotation of the distribution of relevant docs
+    lm_relevant <- lm(formula = y ~ x, data = data.frame(x = x[idx_doc_rel],
+                                                         y = y[idx_doc_rel]))
+  } else {
+    # otherwise chech the rotation of the distribution of judged docs
+    lm_relevant <- lm(formula = y ~ x, data = data.frame(x = x[idx_doc_judged],
+                                                         y = y[idx_doc_judged]))
+  }
+  abline(lm_relevant, lty = 2, lwd = 0.7, col = "green")
+  
+  # find non relevant interpolation
+  # if there is a sufficient number of relevant documents
+  if(length(idx_doc_nonrel) >= 3) {
+    # chech the rotation of the distribution of relevant docs
+    lm_nonrelevant <- lm(formula = y ~ x, data = data.frame(x = x[idx_doc_nonrel],
+                                                          y = y[idx_doc_nonrel]))
+  } else {
+    # otherwise chech the rotation of the distribution of judged docs
+    lm_nonrelevant <- lm(formula = y ~ x, data = data.frame(x = x[idx_doc_to_judge],
+                                                         y = y[idx_doc_to_judge]))
+  }
+  
+  abline(lm_nonrelevant, lty = 2, lwd = 0.5, col = "red")
+  
+  # get slopes
+  m_rel <- lm_relevant$coefficients[2]
+  m_nonrel <- lm_nonrelevant$coefficients[2]
+  
+  # get higher slope
+  m_classify <- ifelse(m_rel > m_nonrel, m_rel, m_nonrel)
+  
+  # adjust slope if necessary
+  if (m_classify < 1.0) {
+    m_classify <- 1.0
+  }
+  
+  # if there is at least one relevant document
+  if (length(idx_doc_rel) > 0) {
+    # find "highest" relevant point (least relevant point according to m_rel)
+    q_classify <- sort(y[idx_doc_rel] - m_classify * x[idx_doc_rel], decreasing = T)
+  } else {
+    # otherwise use most relevant document among *non-relevants* documents
+    q_classify <- sort(y[idx_doc_nonrel] - m_classify * x[idx_doc_nonrel], decreasing = F)
+  }
+  abline(q_classify[1], m_classify, lty = 3, lwd = 1)
+  
+  # find how many documents are below this point
+  num_doc_below_line <- sum(y[idx_doc_to_judge] <= m_classify * x[idx_doc_to_judge] + q_classify[1])
+  
+  # set new threshold (geometric series, user will read at most 2 * threshold documents)
+  thr <- floor(thresh / 2)
+  
+  # keep reading until threshold is zero 
+  while (thr > 0) {
+    
+    # keep count of documents to judge at this round  
+    num_doc_to_judge <- thr
+    
+    # keep track of the remaning documents
+    if (num_doc_to_judge > sum(relevance_feedback == -1)) {
+      num_doc_to_judge <- sum(relevance_feedback == -1)
+    }
+    
+    while (num_doc_to_judge > 0) {
+      
+      # keep track of the index "i" for selection strategy
+      i <- i + 1
+      
+      # judge documents below line if any
+      if (num_doc_below_line > 0) {
+        
+        # rank documents with non zero features and m_rel
+        ranking <- rank_documents_stem(features_nonzero, m = m_rel)
+        
+        # set the number of top k documents to assess (k = 1)
+        pids_feedback <- get_next_k_docs(ranking, qrels, relevance_feedback, k = 1)
+        
+        # get scores of top k
+        scores <- ranking$scores[which(ranking$pids %in% pids_feedback)]
+        
+        # get indexes of documents to get relevance scores
+        idx_pids_feedback <- which(qrels$pid %in% pids_feedback)
+        
+        # update relevance feedback vector
+        relevance_feedback[idx_pids_feedback] <- qrels$relevant[idx_pids_feedback]
+        
+        # update selection strategy vector
+        selection_strategy <- selection_strategy %>%
+          bind_rows(data.frame(round = i,
+                               id = idx_pids_feedback, 
+                               relevance = relevance_feedback[idx_pids_feedback],
+                               strategy = "ranked"))
+        
+        # update docs below line (in case no relevant documents were found)
+        num_doc_below_line <- num_doc_below_line - 1
+        
+      } else { # or sample from collection
+        
+        # first, try to read one more document from the ranking (more promising)
+        ########################################################
+        ranking <- rank_documents_stem(features_nonzero, m = m_classify)
+        
+        # set the number of top k documents to assess (k = 1)
+        pids_feedback <- get_next_k_docs(ranking, qrels, relevance_feedback, k = 1)
+        
+        # get scores of top k
+        scores <- ranking$scores[which(ranking$pids %in% pids_feedback)]
+        
+        # get indexes of documents to get relevance scores
+        idx_pids_feedback <- which(qrels$pid %in% pids_feedback)
+        
+        # update relevance feedback vector
+        relevance_feedback[idx_pids_feedback] <- qrels$relevant[idx_pids_feedback]
+        
+        # update selection strategy vector
+        selection_strategy <- selection_strategy %>%
+          bind_rows(data.frame(round = i,
+                               id = idx_pids_feedback, 
+                               relevance = relevance_feedback[idx_pids_feedback],
+                               strategy = "ranked"))
+        
+        # update index
+        i <- i + 1
+        
+        # update documents to judge
+        num_doc_to_judge <- num_doc_to_judge - 1
+        
+        # update run item
+        run_update <- data.frame(topic_id = topic,
+                                 interaction = 0,
+                                 pid = pids_feedback,
+                                 rank = sum(relevance_feedback != -1), # (sum(relevance_feedback != -1) + 1):(sum(relevance_feedback != -1) + 1),
+                                 score = -scores, #invert scores for treceval
+                                 run_id = run_name,
+                                 relevance = relevance_feedback[idx_pids_feedback])
+        
+        # write run on file
+        write.table(run_update, file = paste0("./runs/local/", run_name),
+                    row.names = FALSE,
+                    col.names = FALSE,
+                    quote = FALSE,
+                    append = T)
+        
+        # ########################################################
+        # # now sample
+        # 
+        # # get next sample to read
+        # idx_pids_feedback <- samples_not_ranked[next_sample_to_read]
+        # next_sample_to_read <- next_sample_to_read + 1
+        # 
+        # # check whether this doc has already been judged
+        # if (relevance_feedback[idx_pids_feedback] == -1) {
+        #   
+        #   # get pids
+        #   pids_feedback <- qrels$pid[idx_pids_feedback]
+        #   
+        #   # set score (zero, since it has not been ranked)
+        #   scores <- 0
+        #   
+        #   # update relevance feedback vector
+        #   relevance_feedback[idx_pids_feedback] <- qrels$relevant[idx_pids_feedback]
+        #   
+        #   # update selection strategy vector
+        #   selection_strategy[i, ] <- data.frame(idx_pids_feedback, 
+        #                                         relevance_feedback[idx_pids_feedback],
+        #                                         "sampled")
+        #   
+        # } else {
+        #   
+        #   # update selection strategy vector
+        #   selection_strategy[i, ] <- data.frame(idx_pids_feedback, 
+        #                                         relevance_feedback[idx_pids_feedback],
+        #                                         "sampled")
+        #   
+        #   # continue while loop (skip following code)
+        #   #next
+        #   
+        # }
+        
+      } # endifelse num doc below line
+      
+      # update run item
+      run_update <- tibble(topic_id = topic,
+                               interaction = 0,
+                               pid = pids_feedback,
+                               rank = sum(relevance_feedback != -1), # (sum(relevance_feedback != -1) + 1):(sum(relevance_feedback != -1) + 1),
+                               score = -scores, #invert scores for treceval
+                               run_id = run_name,
+                               relevance = relevance_feedback[idx_pids_feedback])
+      
+      # write run on file
+      write.table(run_update, file = paste0("./runs/local/", run_name),
+                  row.names = FALSE,
+                  col.names = FALSE,
+                  quote = FALSE,
+                  append = T)
+      
+      # update only if necessary
+      if (num_of_rel_documents < sum(relevance_feedback == 1)) {
+        
+        # compute number of relevant documents
+        num_of_rel_documents <- sum(relevance_feedback == 1)
+        
+        # estimate the parameters for the relevant set and the relevant features
+        if(num_of_rel_documents > 1) {
+          # document frequency
+          doc_freq <- colSums(sparse_binary[relevance_feedback == 1, ])
+          # compute relevant parameters
+          theta_rel <- (doc_freq + alpha_rel) / (num_of_rel_documents + alpha_rel + beta_rel)
+          
+          features_nonzero <- which(colSums(sparse_binary[relevance_feedback == 1, ]) > 0)
+          
+        } else if (num_of_rel_documents == 1) {
+          doc_freq <- sparse_binary[relevance_feedback == 1, ]
+          theta_rel <- (doc_freq + alpha_rel) / (num_of_rel_documents + alpha_rel + beta_rel)
+          
+          features_nonzero <- which(sparse_binary[relevance_feedback == 1, ] > 0)
+        } else {
+          features_nonzero <- which(colSums(sparse_binary[relevance_feedback == 0, ]) > 0)
+        }
+        # re-estimate the parameters for the non-relevant set (including unjudged)
+        theta_nonrel <- (colSums(sparse_binary[relevance_feedback < 1, ]) + alpha_nonrel) / (num_of_documents - num_of_rel_documents + alpha_nonrel + beta_nonrel)
+        
+        # BIM weight for relevant and non relevant set (log(theta / (1 - theta)))
+        bim_rel <- log(theta_rel) - log(1 - theta_rel)
+        bim_nonrel <- log(theta_nonrel) - log(1 - theta_nonrel)
+        
+        # features non zero
+        # features_nonzero <- which(colSums(sparse_binary[relevance_feedback == 1, ]) > 0)
+        
+        # compute coordinates only on relevant features
+        x <- sparse_bm25[, features_nonzero] %*% bim_rel[features_nonzero]
+        y <- sparse_bm25[, features_nonzero] %*% bim_nonrel[features_nonzero]
+        #plot(x, y, col = relevance_feedback + 2, cex = 0.5)
+        
+        # get indexes of relevant documents
+        idx_doc_rel <- which(relevance_feedback == 1)
+        idx_doc_nonrel <- which(relevance_feedback == 0)
+        
+        # indexes of judged documents
+        idx_doc_judged <- which(relevance_feedback > -1)
+        
+        # indexes of to be judged documents
+        idx_doc_to_judge <- which(relevance_feedback < 0)
+        
+        # if there is a sufficient number of relevant documents
+        if(length(idx_doc_rel) >= 3) {
+          # chech the rotation of the distribution of relevant docs
+          lm_relevant <- lm(formula = y ~ x, data = data.frame(x = x[idx_doc_rel],
+                                                               y = y[idx_doc_rel]))
+        } else {
+          # otherwise chech the rotation of the distribution of judged docs
+          lm_relevant <- lm(formula = y ~ x, data = data.frame(x = x[idx_doc_judged],
+                                                               y = y[idx_doc_judged]))
+        }
+        #abline(lm_relevant, lty = 2, lwd = 0.5)
+        
+        # find non relevant interpolation
+        lm_nonrelevant <- lm(formula = y ~ x, data = data.frame(x = x[idx_doc_nonrel],
+                                                                y = y[idx_doc_nonrel]))
+        
+        # get slopes
+        m_rel <- lm_relevant$coefficients[2]
+        m_nonrel <- lm_nonrelevant$coefficients[2]
+        
+        # get higher slope
+        m_classify <- ifelse(m_rel > m_nonrel, m_rel, m_nonrel)
+        
+        # adjust slope if necessary
+        if (m_classify < 1.0) {
+          m_classify <- 1.0
+        }
+        
+        # if there is at least one relevant document
+        if (length(idx_doc_rel) > 0) {
+          # find "highest" relevant point (least relevant point according to m_rel)
+          q_classify <- sort(y[idx_doc_rel] - m_classify * x[idx_doc_rel], decreasing = T)
+        } else {
+          # otherwise use most relevant document among *non-relevants* documents
+          q_classify <- sort(y[idx_doc_nonrel] - m_classify * x[idx_doc_nonrel], decreasing = F)
+        }
+        
+        # find how many documents are below this point
+        num_doc_below_line <- sum(y[idx_doc_to_judge] <= m_classify * x[idx_doc_to_judge] + q_classify[1])
+        
+      } # endif found new relevant
+      
+      # update documents to judge
+      num_doc_to_judge <- num_doc_to_judge - 1
+      
+    } # endif num_doc_below_line
+    
+    # recompute coordinates (changes in non rel docs)
+    num_of_rel_documents <- sum(relevance_feedback == 1)
+    
+    # estimate the parameters for the relevant set and the relevant features
+    if(num_of_rel_documents > 1) {
+      # document frequency
+      doc_freq <- colSums(sparse_binary[relevance_feedback == 1, ])
+      # compute relevant parameters
+      theta_rel <- (doc_freq + alpha_rel) / (num_of_rel_documents + alpha_rel + beta_rel)
+      
+      # recompute non zero features
+      features_nonzero <- which(colSums(sparse_binary[relevance_feedback == 1, ]) > 0)
+      
+    } else if (num_of_rel_documents == 1) {
+      doc_freq <- sparse_binary[relevance_feedback == 1, ]
+      theta_rel <- (doc_freq + alpha_rel) / (num_of_rel_documents + alpha_rel + beta_rel)
+      
+      # recompute non zero features
+      features_nonzero <- which(sparse_binary[relevance_feedback == 1, ] > 0)
+      
+    } else {
+      
+      # recompute non zero features
+      features_nonzero <- which(colSums(sparse_binary[relevance_feedback == 0, ]) > 0)
+      
+    }
+    # re-estimate the parameters for the non-relevant set (including unjudged)
+    theta_nonrel <- (colSums(sparse_binary[relevance_feedback < 1, ]) + alpha_nonrel) / (num_of_documents - num_of_rel_documents + alpha_nonrel + beta_nonrel)
+    
+    # BIM weight for relevant and non relevant set (log(theta / (1 - theta)))
+    bim_rel <- log(theta_rel) - log(1 - theta_rel)
+    bim_nonrel <- log(theta_nonrel) - log(1 - theta_nonrel)
+    
+    # compute coordinates only on relevant features
+    x <- sparse_bm25[, features_nonzero] %*% bim_rel[features_nonzero]
+    y <- sparse_bm25[, features_nonzero] %*% bim_nonrel[features_nonzero]
+    #plot(x, y, col = relevance_feedback + 2, cex = 0.5)
+    
+    # get indexes of relevant documents
+    idx_doc_rel <- which(relevance_feedback == 1)
+    idx_doc_nonrel <- which(relevance_feedback == 0)
+    
+    # indexes of judged documents
+    idx_doc_judged <- which(relevance_feedback > -1)
+    
+    # indexes of to be judged documents
+    idx_doc_to_judge <- which(relevance_feedback < 0)
+    
+    # if there is a sufficient number of relevant documents
+    if(length(idx_doc_rel) >= 3) {
+      # chech the rotation of the distribution of relevant docs
+      lm_relevant <- lm(formula = y ~ x, data = data.frame(x = x[idx_doc_rel],
+                                                           y = y[idx_doc_rel]))
+    } else {
+      # otherwise chech the rotation of the distribution of judged docs
+      lm_relevant <- lm(formula = y ~ x, data = data.frame(x = x[idx_doc_judged],
+                                                           y = y[idx_doc_judged]))
+    }
+    #abline(lm_relevant, lty = 2, lwd = 0.5)
+    
+    # find non relevant interpolation
+    lm_nonrelevant <- lm(formula = y ~ x, data = data.frame(x = x[idx_doc_nonrel],
+                                                            y = y[idx_doc_nonrel]))
+    
+    # get slopes
+    m_rel <- lm_relevant$coefficients[2]
+    m_nonrel <- lm_nonrelevant$coefficients[2]
+    
+    # get higher slope
+    m_classify <- ifelse(m_rel > m_nonrel, m_rel, m_nonrel)
+    
+    # adjust slope if necessary
+    if (m_classify < 1.0) {
+      m_classify <- 1.0
+    }
+    
+    # if there is at least one relevant document
+    if (length(idx_doc_rel) > 0) {
+      # find "highest" relevant point (least relevant point according to m_rel)
+      q_classify <- sort(y[idx_doc_rel] - m_classify * x[idx_doc_rel], decreasing = T)
+    } else {
+      # otherwise use most relevant document among *non-relevants* documents
+      q_classify <- sort(y[idx_doc_nonrel] - m_classify * x[idx_doc_nonrel], decreasing = F)
+    }
+    #abline(q_classify[1], m_classify, lty = 2, lwd = 0.5)
+    
+    # find how many documents are below this point
+    num_doc_below_line <- sum(y[idx_doc_to_judge] <= m_classify * x[idx_doc_to_judge] + q_classify[1])
+    
+    # update threshold
+    thr <- floor(thr / 2)
+    
+  } # endif num_doc_to_judge
+  
+  ##################################################################
+  ##### END CLASSIFICATION
+  ##################################################################
+  plot(x, y, col = relevance_feedback + 2, cex = 0.5)
+  
+  # complete run with the remaining PIDs (only for CLEf 2018)
+  ranking <- rank_documents_stem(features_nonzero, m = m_rel)
+  
+  # all the remaining docs
+  pids_feedback <- get_next_k_docs(ranking, qrels, relevance_feedback)
+  
+  # get scores of top k
+  scores <- ranking$scores[which(ranking$pids %in% pids_feedback)]
+  
+  # get indexes of documents to get relevance scores
+  idx_pids_feedback <- which(qrels$pid %in% pids_feedback)
+  
+  # get last rank
+  last_rank <- run_update$rank
+  
+} #endif topic
+
+# reload run and remove last column (for CLEF evaluation)
+run_local <- read.table(paste0("./runs/local/", run_name), 
+                        stringsAsFactors =  F, 
+                        header = F)
+str(run_local)
+
+write.table(run_local[, 1:6], 
+            file = paste0("./runs/clef/", run_name),
+            row.names = FALSE,
+            col.names = FALSE,
+            quote = FALSE)
+
+```
+
+evaluate run
+
+```{r evaluate}
+
+run <- read.table(paste0("./runs/local/", run_name),
+                  header = FALSE,
+                  stringsAsFactors = FALSE,
+                  colClasses = c("character",
+                                 "numeric",
+                                 "character",
+                                 "numeric",
+                                 "numeric",
+                                 "character",
+                                 "numeric"))
+
+names(run) <- c("topic_id",
+                "interaction",
+                "pid",
+                "rank",
+                "score",
+                "run_id",
+                "relevance")
+
+
+run <- run %>% 
+  distinct(topic_id, pid, .keep_all = TRUE) %>%
+  group_by(topic_id) %>%
+  mutate(rank = row_number()) %>%
+  ungroup()
+
+run %>% group_by(topic_id) %>% summarise(recall = sum(relevance))
+
+#topics <- sort(unique(qrel_abs_test$topic))
+topics <- unique(run$topic_id)
+
+# build measures data frame
+eval_measures <- data.frame(num_docs          = rep(0, length(topics)),
+                            num_rels          = rep(0, length(topics)),
+                            rels_found        = rep(0, length(topics)),
+                            #wss_95            = rep(0, length(topics)), # TODO
+                            last_rel          = rep(0, length(topics)),
+                            num_shown         = rep(0, length(topics)),
+                            #wss_100           = rep(0, length(topics)), # TODO
+                            num_feedback      = rep(0, length(topics)),
+                            precision_at_1    = rep(0, length(topics)),
+                            precision_at_5    = rep(0, length(topics)),
+                            precision_at_10   = rep(0, length(topics)),
+                            precision_at_15   = rep(0, length(topics)),
+                            precision_at_20   = rep(0, length(topics)),
+                            precision_at_30   = rep(0, length(topics)),
+                            precision_at_50   = rep(0, length(topics)),
+                            precision_at_100  = rep(0, length(topics)),
+                            precision_at_200  = rep(0, length(topics)),
+                            precision_at_500  = rep(0, length(topics)),
+                            precision_at_1000 = rep(0, length(topics)),
+                            recall            = rep(0, length(topics)),
+                            recall_at_R       = rep(0, length(topics)),
+                            recall_at_R_100   = rep(0, length(topics)),
+                            recall_at_2R      = rep(0, length(topics)),
+                            recall_at_2R_100  = rep(0, length(topics)),
+                            recall_at_4R      = rep(0, length(topics)),
+                            recall_at_4R_100  = rep(0, length(topics)))
+
+# give rows topic ids
+row.names(eval_measures) <- topics
+
+# build cost-recall dataframe
+cost_recall <- matrix(0, nrow = 101, ncol = length(topics))
+colnames(cost_recall) <- topics
+
+# build plot
+df_empty <- data.frame()
+ggp_cost_recall  <- ggplot(df_empty) + geom_point() + xlim(0, 1) + ylim(0, 1)
+ggp_precision_at <- ggplot(df_empty) + geom_point() + ylim(0, 1)
+
+
+for(topic in topics) {
+#{
+  #topic <- topics[2] or topic <- topics[which(topics == "CD007394")]
+  #topic <- topics[1]
+
+  # extract run data for this topic
+  run_topic <- run[run$topic_id == topic, ]
+  
+  ## get docs
+  #qrel_topic <- qrel_abs_test[qrel_abs_test$topic == topic, ]
+  
+  # extract pids of relevant documents
+  #qrel_topic_pids <- qrel_topic[qrel_topic$relevancy == 1, "pid"]
+  
+  # num of relevant document (assessments)
+  rel_docs <- qrels_abs_test[qrels_abs_test$topic == topic & qrels_abs_test$relevant == 1, ]
+  
+  # number of documents
+  num_docs <- dim(run_topic)[1]
+  
+  # number of relevant documents #### LEIF
+  # num_rels <- sum(run_topic$relevance)
+  num_rels <- sum(rel_docs$relevant)
+  
+  # find cut
+  threshold <- which(run_topic$interaction == 1)
+  
+  if (length(threshold) == 0) {
+    threshold <- dim(run_topic)[1]
+  }
+  
+  # threshold run  
+  run_topic_thres <- run_topic[1:threshold, ]
+  
+  # number of documents #### LEIF
+  num_shown <- nrow(run_topic_thres)
+  
+  # extract pids from run
+  #run_topic_pids_thres <- run_topic_thres[, "pid"]
+  
+  # find relevant docs of run
+  #run_topic_rel <- intersect(run_topic_pids_thres, qrel_topic_pids)
+  
+  # number of relevant docs retrieved ### LEIF
+  rels_found <- sum(run_topic_thres$relevance)
+  
+  # find index of last relevant ### LEIF
+  last_rel <- max(which(run_topic_thres$relevance == 1))
+  
+  if (last_rel == -Inf) {
+    last_rel <- num_shown + 1
+  }
+  
+  # find number of feedback ### LEIF
+  num_feedback <- num_shown #sum(run_topic$interaction == "AF")
+  
+  # create relevance vector
+  #relevance <- rep(0, num_shown)
+  relevance <- run_topic$relevance[1:threshold]
+  
+  # update relevance with true relevant docs 
+  #relevance[which(is.element(run_topic_pids, run_topic_rel))] <- 1
+  
+  # compute precision at 1
+  precision_at_1 <- relevance[1]
+  
+  # compute recall at 5
+  precision_at_5 <- sum(relevance[1:5])/5
+  
+  # compute recall at 10
+  precision_at_10 <- sum(relevance[1:10])/10
+  
+  # compute recall at 15
+  if(length(relevance) < 15) {
+    precision_at_15 <- sum(relevance[1:length(relevance)])/length(relevance)
+  } else {
+    precision_at_15 <- sum(relevance[1:15])/15  
+  }
+  
+  # compute recall at 20
+  if(length(relevance) < 20) {
+    precision_at_20 <- sum(relevance[1:length(relevance)])/length(relevance)
+  } else {
+    precision_at_20 <- sum(relevance[1:20])/20  
+  }
+  
+  # compute recall at 30
+  if(length(relevance) < 30) {
+    precision_at_30 <- sum(relevance[1:length(relevance)])/length(relevance)
+  } else {
+    precision_at_30 <- sum(relevance[1:30])/30  
+  }
+  
+  # compute recall at 50
+  if(length(relevance) < 50) {
+    precision_at_50 <- sum(relevance[1:length(relevance)])/length(relevance)
+  } else {
+    precision_at_50 <- sum(relevance[1:50])/50  
+  }
+  
+  # compute recall at 100
+  if(length(relevance) < 100) {
+    precision_at_100 <- sum(relevance[1:length(relevance)])/length(relevance)
+  } else {
+    precision_at_100 <- sum(relevance[1:100])/100  
+  }
+  
+  # compute recall at 200
+  if(length(relevance) < 200) {
+    precision_at_200 <- sum(relevance[1:length(relevance)])/length(relevance)
+  } else {
+    precision_at_200 <- sum(relevance[1:200])/200  
+  }
+  
+  # compute recall at 500
+  if(length(relevance) < 500) {
+    precision_at_500 <- sum(relevance[1:length(relevance)])/length(relevance)
+  } else {
+    precision_at_500 <- sum(relevance[1:500])/500  
+  }
+  
+  # compute recall at 1000
+  if(length(relevance) < 1000) {
+    precision_at_1000 <- sum(relevance[1:length(relevance)])/length(relevance)
+  } else {
+    precision_at_1000 <- sum(relevance[1:1000])/1000  
+  }
+  
+  # compute recall
+  recall <- rels_found/num_rels
+  
+  # compute recall at R
+  recall_at_R <- sum(relevance[1:num_rels], na.rm = TRUE)/num_rels
+  
+  # compute recall at R + 100
+  recall_at_R_100 <- sum(relevance[1:(num_rels + 100)], na.rm = TRUE)/num_rels
+  
+  # compute recall at 2R
+  recall_at_2R <- sum(relevance[1:(2 * num_rels)], na.rm = TRUE)/num_rels
+  
+  # compute recall at 2R + 100
+  recall_at_2R_100 <- sum(relevance[1:((2 * num_rels) + 100)], na.rm = TRUE)/num_rels
+  
+  # compute recall at 4R
+  recall_at_4R <- sum(relevance[1:(4 * num_rels)], na.rm = TRUE)/num_rels
+  
+  # compute recall at 4R + 100
+  recall_at_4R_100 <- sum(relevance[1:((4 * num_rels) + 100)], na.rm = TRUE)/num_rels
+  
+  # # compute docs at recall 70
+  # docs_at_recall70 <- min(which(cumsum(relevance) >= true_rel_docs * 0.7))
+  # 
+  # # compute docs at recall 80
+  # docs_at_recall80 <- min(which(cumsum(relevance) >= true_rel_docs * 0.8))
+  # 
+  # # compute docs at recall 90
+  # docs_at_recall90 <- min(which(cumsum(relevance) >= true_rel_docs * 0.9))
+  # 
+  # # compute docs at recall 100
+  # docs_at_recall100 <- min(which(cumsum(relevance) == true_rel_docs))
+  
+  eval_measures[topic, "num_docs"]          <- num_docs
+  eval_measures[topic, "num_rels"]          <- num_rels
+  eval_measures[topic, "rels_found"]        <- rels_found
+  eval_measures[topic, "last_rel"]          <- last_rel
+  eval_measures[topic, "num_shown"]         <- num_shown
+  eval_measures[topic, "num_feedback"]      <- num_feedback
+  eval_measures[topic, "precision_at_1"]    <- precision_at_1
+  eval_measures[topic, "precision_at_5"]    <- precision_at_5
+  eval_measures[topic, "precision_at_10"]   <- precision_at_10
+  eval_measures[topic, "precision_at_15"]   <- precision_at_15
+  eval_measures[topic, "precision_at_20"]   <- precision_at_20
+  eval_measures[topic, "precision_at_30"]   <- precision_at_30
+  eval_measures[topic, "precision_at_50"]   <- precision_at_50
+  eval_measures[topic, "precision_at_100"]  <- precision_at_100
+  eval_measures[topic, "precision_at_200"]  <- precision_at_200
+  eval_measures[topic, "precision_at_500"]  <- precision_at_500
+  eval_measures[topic, "precision_at_1000"] <- precision_at_1000
+  eval_measures[topic, "recall"]            <- recall
+  eval_measures[topic, "recall_at_R"]       <- recall_at_R
+  eval_measures[topic, "recall_at_R_100"]   <- recall_at_R_100
+  eval_measures[topic, "recall_at_2R"]      <- recall_at_2R
+  eval_measures[topic, "recall_at_2R_100"]  <- recall_at_2R_100
+  eval_measures[topic, "recall_at_4R"]      <- recall_at_4R
+  eval_measures[topic, "recall_at_4R_100"]  <- recall_at_4R_100
+  
+  # plot normalized cost-recall plot
+  df <- data.frame(cost = (1:num_shown)/num_docs,
+                   recall = cumsum(run_topic_thres$relevance)/num_rels)
+  #plot(df, type = "l")
+  #df <- data.frame(cost = (1:length(relevance))/length(relevance), 
+  #                 recall = cumsum(relevance)/sum(relevance))
+  
+  # compute recall at fixed costs (0.1, 0.2, ...)
+  costs <- rep(0, 101)
+  
+  for(i in 1:101) {
+
+    find_min <- min(which(df$cost >= (i - 1)/100))
+    
+    if (find_min == Inf) {
+      costs[i] <- recall
+    } else {
+      costs[i] <- df$recall[find_min]
+    }
+    
+  }
+  # save into cost_recall matrix
+  cost_recall[, topic] <- costs
+  
+  ggp_cost_recall <- ggp_cost_recall + geom_line(data = data.frame(cost = seq(0, 1, 0.01),
+                                                                   recall = costs),
+                                                 aes(x = cost, y = recall), colour = "lightgrey")
+
+  
+  df_precision_at <- data.frame(at = c(1, 5, 10, 15, 20, 30, 50, 100, 200, 500, 1000), 
+                                precision = as.numeric(eval_measures[topic, 7:17]))
+  
+  ggp_precision_at <- ggp_precision_at + geom_line(data = df_precision_at, 
+                                                   aes(x = at, y = precision), 
+                                                   colour = "lightgrey")
+  
+}
+
+ggp_cost_recall <- ggp_cost_recall + 
+  geom_line(data = data.frame(cost = seq(0, 1, 0.01), 
+                              recall = rowMeans(cost_recall)),
+            aes(x = cost, y = recall), 
+            colour = "red") +
+  geom_abline(slope = 0, intercept = mean(eval_measures$recall_at_R),
+              colour = "blue")
+
+#print(ggp_cost_recall)
+
+
+ggp_precision_at <- ggp_precision_at + 
+  geom_line(data = data.frame(at = c(1, 5, 10, 15, 20, 30, 50, 100, 200, 500, 1000),
+                              precision = colMeans(eval_measures[, 7:17])),
+            aes(x = at, y = precision), 
+            colour = "red") +
+  scale_x_continuous(breaks = c(1, 5, 10, 15, 20, 30, 50, 100, 200, 500, 1000),
+                     trans = "log10")
+
+
+#print(ggp_precision_at)
+
+grid.arrange(ggp_cost_recall, ggp_precision_at, top = run_id)
+
+avg_measures <- colMeans(eval_measures)
+
+print(format(colMeans(eval_measures), digits = 3, nsmall = 3))
+
+#print(format(colMeans(eval_measures), digits = 3, nsmall = 3))
+#save(eval_measures, file = paste0("./runs/", run_id, "_eval.RData"))
+
+mean(eval_measures$rels_found / eval_measures$num_rels)
+
+eval_measures[, c("num_rels", "rels_found", "num_shown")] %>% 
+  mutate(recall = rels_found/num_rels) %>% 
+  summarise(docs_shown = sum(num_shown), avg_recall = mean(recall))
+
+
+```
+
+
+
